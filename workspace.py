@@ -200,7 +200,7 @@ def branch_exists(branch_name):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: agent <command> [args]")
+        print("Usage: workspace <command> [args]")
         print("Commands:")
         print("  create <branch-name>   Create and switch to a git worktree")
         print("  attach [branch-name]   Attach to an existing worktree")
@@ -218,13 +218,13 @@ def main():
 
     if command == "create":
         if len(sys.argv) != 3:
-            print("Usage: agent create <branch-name>")
+            print("Usage: workspace create <branch-name>")
             sys.exit(1)
         branch_name = sys.argv[2]
         create_worktree(branch_name)
     elif command == "attach":
         if len(sys.argv) > 3:
-            print("Usage: agent attach [branch-name]")
+            print("Usage: workspace attach [branch-name]")
             sys.exit(1)
 
         if len(sys.argv) == 3:
@@ -249,7 +249,7 @@ def main():
                     branch_name = args[i]
                 else:
                     print("Error: Too many arguments")
-                    print("Usage: agent destroy [branch-name] [--force]")
+                    print("Usage: workspace destroy [branch-name] [--force]")
                     sys.exit(1)
             i += 1
 
@@ -261,7 +261,7 @@ def main():
             destroy_worktree(branch_name, force=force)
     else:
         print(f"Unknown command: {command}")
-        print("Usage: agent <command> [args]")
+        print("Usage: workspace <command> [args]")
         print("Commands:")
         print("  create <branch-name>   Create and switch to a git worktree")
         print("  attach [branch-name]   Attach to an existing worktree")
