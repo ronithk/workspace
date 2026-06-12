@@ -675,7 +675,7 @@ def is_branch_tip_pushed(branch_name):
 
 
 def destroy_worktree_interactive(force=False):
-    """Interactive mode for destroying worktrees."""
+    """Interactive mode for destroying one or more worktrees."""
     # Get all worktrees
     worktrees = get_all_worktrees()
 
@@ -688,31 +688,51 @@ def destroy_worktree_interactive(force=False):
     for branch_name, path in worktrees:
         menu_options.append(branch_name)
 
-    # Add cancel option
-    menu_options.append("Cancel")
-
     # Show interactive menu
-    terminal_menu = TerminalMenu(menu_options, title="Select a worktree to destroy:")
-    menu_entry_index = terminal_menu.show()
+    menu_title = (
+        "Select worktrees to destroy "
+        "(space to toggle, enter to continue, q to cancel):"
+    )
+    terminal_menu = TerminalMenu(
+        menu_options,
+        title=menu_title,
+        multi_select=True,
+        multi_select_select_on_accept=False,
+        show_multi_select_hint=True,
+    )
+    menu_entry_indices = terminal_menu.show()
 
     # Handle selection
-    if menu_entry_index is None or menu_entry_index == len(menu_options) - 1:
+    if menu_entry_indices is None:
         print("Cancelled.")
         return
 
-    # Get selected branch name
-    selected_branch = worktrees[menu_entry_index][0]
+    # Get selected branch names
+    selected_branches = [worktrees[index][0] for index in menu_entry_indices]
+    if not selected_branches:
+        print("Cancelled.")
+        return
 
     # Confirm destruction
-    print(f"\nSelected: {selected_branch}")
+    print("\nSelected:")
+    for branch_name in selected_branches:
+        print(f"  - {branch_name}")
+
+    plural = len(selected_branches) != 1
+    confirm_title = (
+        f"Are you sure you want to destroy {len(selected_branches)} worktrees?"
+        if plural
+        else f"Are you sure you want to destroy the worktree for '{selected_branches[0]}'?"
+    )
     confirm_menu = TerminalMenu(
-        ["Yes, destroy it", "No, cancel"],
-        title=f"Are you sure you want to destroy the worktree for '{selected_branch}'?",
+        ["Yes, destroy them" if plural else "Yes, destroy it", "No, cancel"],
+        title=confirm_title,
     )
     confirm_index = confirm_menu.show()
 
     if confirm_index == 0:
-        destroy_worktree(selected_branch, force=force)
+        for branch_name in selected_branches:
+            destroy_worktree(branch_name, force=force)
     else:
         print("Cancelled.")
 
