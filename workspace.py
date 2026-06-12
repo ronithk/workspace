@@ -19,6 +19,7 @@ from yaspin import yaspin
 WORKSPACE_CMD = []
 # Untracked paths to copy into newly created worktrees (relative to CWD).
 COPY_UNTRACKED_PATHS = ["DerivedData"]
+REMOTE_BRANCHES_FETCHED = False
 
 
 @contextmanager
@@ -193,35 +194,230 @@ def get_all_worktrees():
 def branch_exists(branch_name):
     """Check if a branch exists."""
     result = run_command(
-        f"git show-ref --verify --quiet refs/heads/{branch_name}", check=False
+        f"git show-ref --verify --quiet {shlex.quote(f'refs/heads/{branch_name}')}",
+        check=False,
     )
     return result.returncode == 0
 
 
+def get_remotes():
+    """Get configured git remotes."""
+    result = run_command("git remote", check=False)
+    if result.returncode != 0:
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def fetch_remote_branches():
+    """Fetch remote branch refs once so branch resolution can see recent remotes."""
+    global REMOTE_BRANCHES_FETCHED
+    if REMOTE_BRANCHES_FETCHED:
+        return
+
+    REMOTE_BRANCHES_FETCHED = True
+    if not get_remotes():
+        return
+
+    with status("Fetching remote branches") as sp:
+        result = run_command("git fetch --all --prune", check=False)
+        if result.returncode == 0:
+            sp.ok("Done")
+            return
+
+        sp.fail("Failed")
+        message = result.stderr.strip() or result.stdout.strip()
+        if message:
+            print(f"Warning: Could not fetch remote branches: {message}")
+
+
+def get_remote_branches():
+    """Get remote branch names in short form, such as origin/main."""
+    result = run_command(
+        "git for-each-ref --format='%(refname:short)' refs/remotes", check=False
+    )
+    if result.returncode != 0:
+        return []
+    return [
+        line.strip()
+        for line in result.stdout.splitlines()
+        if line.strip() and not line.strip().endswith("/HEAD")
+    ]
+
+
+def split_remote_branch(remote_branch, remotes):
+    """Split origin/feature into (origin, feature) using configured remotes."""
+    for remote in sorted(remotes, key=len, reverse=True):
+        prefix = f"{remote}/"
+        if remote_branch.startswith(prefix):
+            return remote, remote_branch[len(prefix) :]
+    return None, None
+
+
+def find_remote_branch(branch_name):
+    """Find a remote branch matching a local or remote-qualified branch name."""
+    remotes = get_remotes()
+    if not remotes:
+        return None
+
+    remote_branches = get_remote_branches()
+    for remote in remotes:
+        prefix = f"{remote}/"
+        if branch_name.startswith(prefix):
+            if branch_name not in remote_branches:
+                return None
+            return {
+                "remote": remote,
+                "remote_branch": branch_name,
+                "local_branch": branch_name[len(prefix) :],
+            }
+
+    matches = []
+    for remote_branch in remote_branches:
+        remote, local_branch = split_remote_branch(remote_branch, remotes)
+        if local_branch == branch_name:
+            matches.append(
+                {
+                    "remote": remote,
+                    "remote_branch": remote_branch,
+                    "local_branch": local_branch,
+                }
+            )
+
+    if not matches:
+        return None
+
+    origin_matches = [match for match in matches if match["remote"] == "origin"]
+    if len(origin_matches) == 1:
+        return origin_matches[0]
+    if len(matches) == 1:
+        return matches[0]
+
+    remote_names = ", ".join(match["remote_branch"] for match in matches)
+    print(f"Error: Branch '{branch_name}' exists on multiple remotes: {remote_names}")
+    print(f"Specify the remote explicitly, for example 'origin/{branch_name}'.")
+    sys.exit(1)
+
+
+def ensure_local_branch_for_remote(remote_match):
+    """Create a local tracking branch for a remote branch if needed."""
+    local_branch = remote_match["local_branch"]
+    remote_branch = remote_match["remote_branch"]
+
+    if branch_exists(local_branch):
+        return local_branch
+
+    with status(f"Checking out remote branch '{remote_branch}' locally") as sp:
+        result = run_command(
+            f"git branch --track {shlex.quote(local_branch)} {shlex.quote(remote_branch)}",
+            check=False,
+        )
+        if result.returncode == 0:
+            sp.ok("Done")
+            return local_branch
+
+        sp.fail("Failed")
+        print(f"Error: Could not create local branch '{local_branch}' from '{remote_branch}'")
+        if result.stderr.strip():
+            print(result.stderr.strip())
+        sys.exit(1)
+
+
+def resolve_existing_branch(branch_name):
+    """Resolve a branch arg to a local branch, creating it from a remote if found."""
+    if branch_exists(branch_name):
+        return branch_name
+
+    fetch_remote_branches()
+    remote_match = find_remote_branch(branch_name)
+    if remote_match:
+        return ensure_local_branch_for_remote(remote_match)
+
+    return branch_name
+
+
+def resolve_base_branch(base_branch):
+    """Resolve a base branch locally or from a matching remote branch."""
+    resolved_branch = resolve_existing_branch(base_branch)
+    if branch_exists(resolved_branch):
+        return resolved_branch
+
+    print(f"Error: Base branch '{base_branch}' was not found locally or on a remote.")
+    sys.exit(1)
+
+
+def print_usage():
+    print("Usage: workspace <command> [args]")
+    print("Commands:")
+    print("  create <branch-name> [--base <branch-name>]  Create and switch to a git worktree")
+    print("  attach [branch-name]                         Attach to an existing worktree")
+    print("                                               (interactive mode if no branch name given)")
+    print("  destroy [branch-name] [--force]              Remove worktree and delete branch")
+    print("                                               (interactive mode if no branch name given)")
+    print("                                               --force: skip merge check and force delete")
+
+
+def print_create_usage():
+    print("Usage: workspace create <branch-name> [--base <branch-name>]")
+
+
+def parse_create_args(args):
+    branch_name = None
+    base_branch = None
+    i = 0
+
+    while i < len(args):
+        arg = args[i]
+        if arg == "--base":
+            if base_branch is not None:
+                print("Error: --base specified more than once")
+                print_create_usage()
+                sys.exit(1)
+            if i + 1 >= len(args):
+                print("Error: --base requires a branch name")
+                print_create_usage()
+                sys.exit(1)
+            base_branch = args[i + 1]
+            i += 2
+        elif arg.startswith("--base="):
+            if base_branch is not None:
+                print("Error: --base specified more than once")
+                print_create_usage()
+                sys.exit(1)
+            base_branch = arg.split("=", 1)[1]
+            if not base_branch:
+                print("Error: --base requires a branch name")
+                print_create_usage()
+                sys.exit(1)
+            i += 1
+        elif arg.startswith("-"):
+            print(f"Error: Unknown option: {arg}")
+            print_create_usage()
+            sys.exit(1)
+        else:
+            if branch_name is not None:
+                print("Error: Too many arguments")
+                print_create_usage()
+                sys.exit(1)
+            branch_name = arg
+            i += 1
+
+    if branch_name is None:
+        print_create_usage()
+        sys.exit(1)
+
+    return branch_name, base_branch
+
+
 def main():
     if len(sys.argv) < 2:
-        print("Usage: workspace <command> [args]")
-        print("Commands:")
-        print("  create <branch-name>   Create and switch to a git worktree")
-        print("  attach [branch-name]   Attach to an existing worktree")
-        print("                         (interactive mode if no branch name given)")
-        print("  destroy [branch-name] [--force]  Remove worktree and delete branch")
-        print(
-            "                                   (interactive mode if no branch name given)"
-        )
-        print(
-            "                                   --force: skip merge check and force delete"
-        )
+        print_usage()
         sys.exit(1)
 
     command = sys.argv[1]
 
     if command == "create":
-        if len(sys.argv) != 3:
-            print("Usage: workspace create <branch-name>")
-            sys.exit(1)
-        branch_name = sys.argv[2]
-        create_worktree(branch_name)
+        branch_name, base_branch = parse_create_args(sys.argv[2:])
+        create_worktree(branch_name, base_branch=base_branch)
     elif command == "attach":
         if len(sys.argv) > 3:
             print("Usage: workspace attach [branch-name]")
@@ -261,33 +457,21 @@ def main():
             destroy_worktree(branch_name, force=force)
     else:
         print(f"Unknown command: {command}")
-        print("Usage: workspace <command> [args]")
-        print("Commands:")
-        print("  create <branch-name>   Create and switch to a git worktree")
-        print("  attach [branch-name]   Attach to an existing worktree")
-        print("                         (interactive mode if no branch name given)")
-        print("  destroy [branch-name] [--force]  Remove worktree and delete branch")
-        print(
-            "                                   (interactive mode if no branch name given)"
-        )
-        print(
-            "                                   --force: skip merge check and force delete"
-        )
+        print_usage()
         sys.exit(1)
 
 
-def create_worktree(branch_name):
+def create_worktree(branch_name, base_branch=None):
     # Get current directory and git root
     current_dir = os.getcwd()
     git_root = get_git_root()
-
-    # Get the current branch to store as parent
-    parent_branch = get_current_branch()
 
     # Calculate relative path from git root to current directory
     relative_path = os.path.relpath(current_dir, git_root)
     if relative_path == ".":
         relative_path = ""
+
+    branch_name = resolve_existing_branch(branch_name)
 
     # Check if worktree already exists
     worktree_path = get_worktree_path(branch_name)
@@ -304,11 +488,13 @@ def create_worktree(branch_name):
     else:
         # Create branch if it doesn't exist
         if not branch_exists(branch_name):
+            parent_branch = resolve_base_branch(base_branch or get_current_branch())
             with status(f"Creating branch '{branch_name}' from '{parent_branch}'") as sp:
-                run_command(f"git checkout -b {branch_name}")
+                run_command(
+                    f"git branch {shlex.quote(branch_name)} {shlex.quote(parent_branch)}"
+                )
                 # Store the parent branch in the description
                 set_branch_parent(branch_name, parent_branch)
-                run_command("git checkout -")  # Switch back to original branch
                 sp.ok("Done")
 
         # Create worktree inside the worktrees container directory
@@ -317,9 +503,12 @@ def create_worktree(branch_name):
         worktrees_container = os.path.join(parent_dir, f"{repo_name}-worktrees")
         os.makedirs(worktrees_container, exist_ok=True)
         worktree_dir = os.path.join(worktrees_container, branch_name)
+        os.makedirs(os.path.dirname(worktree_dir), exist_ok=True)
 
         with status(f"Creating worktree at '{worktree_dir}'") as sp:
-            run_command(f"git worktree add '{worktree_dir}' '{branch_name}'")
+            run_command(
+                f"git worktree add {shlex.quote(worktree_dir)} {shlex.quote(branch_name)}"
+            )
             sp.ok("Done")
         worktree_path = worktree_dir
         created = True
@@ -419,12 +608,18 @@ def get_current_branch():
 def set_branch_parent(branch_name, parent_branch):
     """Set the parent branch in the branch description."""
     description = f"Parent branch: {parent_branch}"
-    run_command(f"git config branch.{branch_name}.description '{description}'")
+    run_command(
+        f"git config {shlex.quote(f'branch.{branch_name}.description')} "
+        f"{shlex.quote(description)}"
+    )
 
 
 def get_branch_parent(branch_name):
     """Get the parent branch from the branch description."""
-    result = run_command(f"git config branch.{branch_name}.description", check=False)
+    result = run_command(
+        f"git config {shlex.quote(f'branch.{branch_name}.description')}",
+        check=False,
+    )
     if result.returncode == 0 and result.stdout.strip():
         description = result.stdout.strip()
         if description.startswith("Parent branch: "):
